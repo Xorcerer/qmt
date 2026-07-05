@@ -33,19 +33,14 @@
 
 ## 部署方式
 
-### 方案 A：沿用当前推荐部署
-1. 将 `loader.py` 复制到 QMT 策略脚本目录。
+1. QMT GUI新建策略，然后将 `loader.py` 的内容复制到策略中，保存。
 2. 将 `server.py`、`server_*_utils.py`、`server_config.json` 放到 `C:\server\`。
-3. 启动 QMT 策略。
+3. 启动 QMT 策略（可以设置为随GUI启动）。
 
 `loader.py` 会按以下顺序寻找 `server.py`：
 - 环境变量 `QMT_WATCH_DIR`
 - `C:\server`
 - `loader.py` 所在目录
-
-### 方案 B：单目录部署
-1. 将 `loader.py`、`server.py`、`server_*_utils.py`、`server_config.json` 放在同一目录。
-2. 若 `server.py` 与 `loader.py` 同目录，`loader.py` 会自动加载该目录下的服务文件。
 
 ### 自定义路径
 - 可通过环境变量 `QMT_WATCH_DIR` 指向 `server.py` 所在目录。
