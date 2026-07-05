@@ -1,0 +1,10 @@
+{
+  "account_id": "your-account-id",
+  "account_type": "STOCK",
+  "auth_token": "replace-with-a-strong-token-or-empty-to-disable",
+  "quote_symbols": [
+    "600000.SH"
+  ],
+  "quote_period": "tick",
+  "quote_dividend_type": "none"
+}
