@@ -1,3 +1,5 @@
+from server_runtime_utils import make_jsonable
+
 def normalize_number(value):
     if value in (None, ''):
         return None
@@ -243,3 +245,44 @@ def build_signals_payload(runtime, symbol, normalize_quote_symbol):
         'highest_buy_price': highest_buy_price,
         'points': points,
     }
+
+
+
+def build_full_tick_payload(runtime, symbols):
+    """调用 ContextInfo.get_full_tick(stock_code=[]) 获取全速 tick 行情。
+
+    symbols: list[str]，空列表表示全市场（取决于 QMT 订阅范围）。
+    返回的 tick dict 逐标的经 normalize_number 归整数值，再经 make_jsonable
+    归整为可序列化结构。
+    """
+    context = runtime.context_ref
+    if context is None:
+        return {'symbols': symbols, 'count': 0, 'data': {}, 'error': 'context_unavailable'}
+    get_full_tick = getattr(context, 'get_full_tick', None)
+    if not callable(get_full_tick):
+        return {'symbols': symbols, 'count': 0, 'data': {}, 'error': 'full_tick_unavailable',
+                'hint': 'ContextInfo.get_full_tick 在当前运行环境不可用'}
+    try:
+        raw = get_full_tick(symbols if symbols else [])
+        tick_fields = ('askPrice', 'bidPrice', 'askVol', 'bidVol')
+        ticks = {}
+        if isinstance(raw, dict):
+            for code, tick in raw.items():
+                if not isinstance(tick, dict):
+                    ticks[code] = make_jsonable(tick)
+                    continue
+                norm = dict(tick)
+                for field in tick_fields:
+                    arr = norm.get(field)
+                    if isinstance(arr, (list, tuple)):
+                        norm[field] = [normalize_number(v) for v in arr]
+                for scalar in ('lastPrice', 'open', 'high', 'low', 'amount', 'volume',
+                               'openInterest', 'transactionNum', 'lastOpenInterest', 'lastVolume',
+                               'lastAmount', 'settlementPrice', 'lastSettlementPrice', 'pe', 'sp'):
+                    if scalar in norm:
+                        norm[scalar] = normalize_number(norm[scalar])
+                ticks[code] = make_jsonable(norm)
+        return {'symbols': symbols, 'count': len(ticks), 'data': ticks}
+    except Exception as exc:  # 单标的/参数异常或归整异常时给出可读错误
+        return {'symbols': symbols, 'count': 0, 'data': {}, 'error': 'full_tick_failed', 'detail': str(exc)}
+
