@@ -26,6 +26,7 @@ from server_market_utils import (
     normalize_int as market_normalize_int,
     normalize_market_time as market_normalize_market_time,
     normalize_number as market_normalize_number,
+    build_full_tick_payload as market_build_full_tick_payload,
 )
 from server_runtime_utils import (
     create_runtime as runtime_create_runtime,
@@ -211,11 +212,14 @@ def _normalize_quote_symbols(values):
         values = values.split(',')
     result = []
     for value in values:
-        normalized = _normalize_quote_symbol(value)
-        if normalized is None:
+        if value is None:
             continue
-        if normalized not in result:
-            result.append(normalized)
+        for part in str(value).split(','): # 支持多个逗号分隔的输入symbol
+            normalized = _normalize_quote_symbol(part)
+            if normalized is None:
+                continue
+            if normalized not in result:
+                result.append(normalized)
     return result
 
 
@@ -1249,6 +1253,23 @@ def _build_quote_payload(symbol):
         'has_data': quote is not None,
     }
 
+def _build_download_history_payload(symbol, period, start, end):
+    normalized_symbol = _normalize_quote_symbol(symbol)
+    if normalized_symbol is None:
+        return {'error': 'symbol_required'}
+
+    function = globals().get('download_history_data')
+    if not callable(function):
+        return {'error': 'download_history_data_unavailable'}
+
+    try:
+        function(symbol, period or '1d', start or '', end or '')
+
+    except Exception as exc:
+        return {'error': 'download_history_failed', 'detail': str(exc),
+                'symbol': symbol, 'period': period or '1d', 'start': start, 'end': end}
+    return {'status': 'downloaded', 'symbol': symbol, 'period': period or '1d',
+            'start': start or '', 'end': end or ''}
 
 def _build_signals_payload(symbol):
     return market_build_signals_payload(RUNTIME, symbol, _normalize_quote_symbol)
@@ -1256,6 +1277,9 @@ def _build_signals_payload(symbol):
 
 def _build_longhubang_payload(symbol, start_time, end_time):
     return market_build_longhubang_payload(RUNTIME, symbol, start_time, end_time, _record_error)
+
+def _build_full_tick_payload(symbols):
+    return market_build_full_tick_payload(RUNTIME, symbols)
 
 
 def _build_accounts_payload():
@@ -1367,11 +1391,14 @@ def _build_instrument_payload(symbol):
     normalized_symbol = _normalize_quote_symbol(symbol)
     if normalized_symbol is None:
         return {'error': 'symbol_required'}
-    function = globals().get('get_instrument_detail')
-    if not callable(function):
-        return {'error': 'instrument_detail_unavailable'}
+    context = RUNTIME.context_ref
+    if context is None:
+        return {'error': 'context_unavailable', }
+    get_instrument_detail = getattr(context, 'get_instrument_detail', None)
+    if not callable(get_instrument_detail):
+        return {'error': 'get_instrument_detail_unavailable', }
     try:
-        detail = function(normalized_symbol)
+        detail = get_instrument_detail(normalized_symbol)
     except Exception as exc:
         return {
             'error': 'instrument_detail_failed',
@@ -1460,7 +1487,9 @@ def _build_http_response(request_bytes):
                 'endpoints': [
                     '/health', '/positions', '/accounts', '/quotes', '/quote',
                     '/orders', '/deals', '/subscribe', '/unsubscribe', '/candles', '/signals', '/instrument',
-                    '/options', '/option-trade-options', '/longhubang', '/order', '/ws', '/debug/trade',
+                    '/options', '/option-trade-options', '/longhubang', '/order', '/ws', 
+                    '/full_tick', '/download_history',
+                    '/debug/trade',
                 ],
             })
         if path == '/health':
@@ -1578,6 +1607,21 @@ def _build_http_response(request_bytes):
             return _build_json_response(200, payload)
         if path == '/accounts':
             return _build_json_response(200, _build_accounts_payload())
+
+        if path == '/full_tick':
+            raw_symbols = query.get('symbols') or query.get('symbol') or []
+            symbols = _normalize_quote_symbols(raw_symbols)
+            return _build_json_response(200, _build_full_tick_payload(symbols))
+        
+        if path == '/download_history':
+            symbol = _normalize_quote_symbol((query.get('symbol') or [None])[0])
+            period = str((query.get('period') or ['1d'])[0] or '1d')
+            start = str((query.get('start') or [''])[0] or '')
+            end = str((query.get('end') or [''])[0] or '')
+            payload = _build_download_history_payload(symbol, period, start, end)
+            status_code = 200 if not payload.get('error') else 400
+            return _build_json_response(status_code, payload)
+        
         if path == '/debug/trade':
             return _build_json_response(200, {
                 'health': _build_health_payload(),
