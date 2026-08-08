@@ -1391,11 +1391,14 @@ def _build_instrument_payload(symbol):
     normalized_symbol = _normalize_quote_symbol(symbol)
     if normalized_symbol is None:
         return {'error': 'symbol_required'}
-    function = globals().get('get_instrument_detail')
-    if not callable(function):
-        return {'error': 'instrument_detail_unavailable'}
+    context = RUNTIME.context_ref
+    if context is None:
+        return {'error': 'context_unavailable', }
+    get_instrument_detail = getattr(context, 'get_instrument_detail', None)
+    if not callable(get_instrument_detail):
+        return {'error': 'get_instrument_detail_unavailable', }
     try:
-        detail = function(normalized_symbol)
+        detail = get_instrument_detail(normalized_symbol)
     except Exception as exc:
         return {
             'error': 'instrument_detail_failed',
