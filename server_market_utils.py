@@ -153,6 +153,75 @@ def build_candles_payload(
         }
 
 
+def build_candles_bulk_payload(
+    runtime,
+    symbols,
+    period,
+    start,
+    end,
+    dividend_type,
+    record_error,
+    batch_size=300,
+):
+    symbols = [symbol for symbol in (symbols or []) if symbol]
+    bars_by_symbol = {}
+    errors = []
+    for offset in range(0, len(symbols), batch_size):
+        chunk = symbols[offset:offset + batch_size]
+        context = runtime.context_ref
+        if context is None:
+            errors.append('context_unavailable')
+            break
+        get_market_data = getattr(context, 'get_market_data', None)
+        if not callable(get_market_data):
+            errors.append('get_market_data_unavailable')
+            break
+        fields = ['open', 'high', 'low', 'close', 'volume', 'amount']
+        kwargs = {
+            'stock_code': chunk,
+            'period': period,
+            'dividend_type': dividend_type,
+            'count': -1,
+        }
+        if start:
+            kwargs['start_time'] = start
+        if end:
+            kwargs['end_time'] = end
+        try:
+            result = get_market_data(fields, **kwargs)
+            for symbol in chunk:
+                symbol_result = result
+                if isinstance(result, dict) and symbol in result:
+                    symbol_result = result.get(symbol)
+                rows = extract_market_rows(symbol_result, fields) if symbol_result is not None else []
+                bars = []
+                for index, row_dict in rows:
+                    bars.append({
+                        'time': normalize_market_time(index, period),
+                        'open': normalize_number(row_dict.get('open')),
+                        'high': normalize_number(row_dict.get('high')),
+                        'low': normalize_number(row_dict.get('low')),
+                        'close': normalize_number(row_dict.get('close')),
+                        'volume': normalize_number(row_dict.get('volume')),
+                        'amount': normalize_number(row_dict.get('amount')),
+                    })
+                bars_by_symbol[symbol] = [bar for bar in bars if bar.get('time') is not None]
+        except Exception:
+            record_error('_build_candles_bulk_payload')
+            errors.append('get_market_data_failed')
+            break
+    return {
+        'period': period,
+        'start': start,
+        'end': end,
+        'dividend_type': dividend_type,
+        'bars_by_symbol': bars_by_symbol,
+        'errors': errors,
+        'requested': len(symbols),
+        'returned': len(bars_by_symbol),
+    }
+
+
 def _dataframe_to_records(df):
     """Convert a pandas DataFrame (or similar) to a list of dicts."""
     if df is None:

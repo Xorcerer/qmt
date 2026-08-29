@@ -20,6 +20,7 @@ from server_http_utils import (
 )
 from server_market_utils import (
     build_candles_payload as market_build_candles_payload,
+    build_candles_bulk_payload as market_build_candles_bulk_payload,
     build_longhubang_payload as market_build_longhubang_payload,
     build_signals_payload as market_build_signals_payload,
     extract_market_rows as market_extract_market_rows,
@@ -722,6 +723,12 @@ def _extract_market_rows(result, fields, period):
 
 def _build_candles_payload(symbol, period, count, start, end, dividend_type):
     return market_build_candles_payload(RUNTIME, symbol, period, count, start, end, dividend_type, _record_error)
+
+
+def _build_candles_bulk_payload(symbols, period, start, end, dividend_type):
+    return market_build_candles_bulk_payload(
+        RUNTIME, symbols, period, start, end, dividend_type, _record_error,
+    )
 
 
 def _store_positions(payload, source, replace):
@@ -1459,7 +1466,7 @@ def _build_http_response(request_bytes):
                 'mode': 'runtime_poll',
                 'endpoints': [
                     '/health', '/positions', '/accounts', '/quotes', '/quote',
-                    '/orders', '/deals', '/subscribe', '/unsubscribe', '/candles', '/signals', '/instrument',
+                    '/orders', '/deals', '/subscribe', '/unsubscribe', '/candles', '/candles-bulk', '/signals', '/instrument',
                     '/options', '/option-trade-options', '/longhubang', '/order', '/ws', '/debug/trade',
                 ],
             })
@@ -1551,6 +1558,16 @@ def _build_http_response(request_bytes):
             if symbol is None:
                 return _build_json_response(404, {'error': 'symbol_required'})
             return _build_json_response(200, _build_candles_payload(symbol, period, count, start, end, dividend_type))
+        if path == '/candles-bulk':
+            symbols_raw = (query.get('symbols') or [''])[0] or ''
+            symbols = [item.strip().upper() for item in symbols_raw.split(',') if item.strip()]
+            period = str((query.get('period') or ['1d'])[0] or '1d')
+            start = (query.get('start') or [None])[0]
+            end = (query.get('end') or [None])[0]
+            dividend_type = str((query.get('dividend_type') or ['none'])[0] or 'none')
+            if not symbols:
+                return _build_json_response(400, {'error': 'symbols_required'})
+            return _build_json_response(200, _build_candles_bulk_payload(symbols, period, start, end, dividend_type))
         if path == '/signals':
             symbol = _normalize_quote_symbol((query.get('symbol') or [None])[0])
             return _build_json_response(200, _build_signals_payload(symbol))
