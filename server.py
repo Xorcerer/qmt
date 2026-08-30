@@ -18,6 +18,14 @@ from server_http_utils import (
     parse_http_request as http_parse_http_request,
     queue_client_response as http_queue_client_response,
 )
+from server_fundamental_utils import (
+    build_divid_factors_payload as fundamental_build_divid_factors_payload,
+    build_instrument_bulk_payload as fundamental_build_instrument_bulk_payload,
+    build_sector_payload as fundamental_build_sector_payload,
+    build_total_share_payload as fundamental_build_total_share_payload,
+    build_trading_dates_payload as fundamental_build_trading_dates_payload,
+    build_turnover_rate_payload as fundamental_build_turnover_rate_payload,
+)
 from server_market_utils import (
     build_candles_payload as market_build_candles_payload,
     build_candles_bulk_payload as market_build_candles_bulk_payload,
@@ -728,6 +736,34 @@ def _build_candles_payload(symbol, period, count, start, end, dividend_type):
 def _build_candles_bulk_payload(symbols, period, start, end, dividend_type):
     return market_build_candles_bulk_payload(
         RUNTIME, symbols, period, start, end, dividend_type, _record_error,
+    )
+
+
+def _build_divid_factors_payload(symbols, start, end):
+    return fundamental_build_divid_factors_payload(RUNTIME, symbols, start, end, _record_error)
+
+
+def _build_instrument_bulk_payload(symbols):
+    return fundamental_build_instrument_bulk_payload(RUNTIME, symbols, _record_error)
+
+
+def _build_turnover_rate_payload(symbols, start, end):
+    return fundamental_build_turnover_rate_payload(RUNTIME, symbols, start, end, _record_error)
+
+
+def _build_total_share_payload(symbols):
+    return fundamental_build_total_share_payload(RUNTIME, symbols, _record_error)
+
+
+def _build_trading_dates_payload(symbol, start, end, count, period):
+    return fundamental_build_trading_dates_payload(
+        RUNTIME, symbol, start, end, count, period, _record_error,
+    )
+
+
+def _build_sector_payload(name, with_weight, index_code, realtime):
+    return fundamental_build_sector_payload(
+        RUNTIME, name, with_weight, index_code, realtime, _record_error,
     )
 
 
@@ -1467,6 +1503,7 @@ def _build_http_response(request_bytes):
                 'endpoints': [
                     '/health', '/positions', '/accounts', '/quotes', '/quote',
                     '/orders', '/deals', '/subscribe', '/unsubscribe', '/candles', '/candles-bulk', '/signals', '/instrument',
+                    '/divid-factors', '/instrument-bulk', '/turnover-rate', '/total-share', '/trading-dates', '/sector',
                     '/options', '/option-trade-options', '/longhubang', '/order', '/ws', '/debug/trade',
                 ],
             })
@@ -1568,6 +1605,54 @@ def _build_http_response(request_bytes):
             if not symbols:
                 return _build_json_response(400, {'error': 'symbols_required'})
             return _build_json_response(200, _build_candles_bulk_payload(symbols, period, start, end, dividend_type))
+        if path == '/divid-factors':
+            symbols_raw = (query.get('symbols') or [''])[0] or ''
+            symbols = [item.strip().upper() for item in symbols_raw.split(',') if item.strip()]
+            start = (query.get('start') or [None])[0]
+            end = (query.get('end') or [None])[0]
+            if not symbols:
+                return _build_json_response(400, {'error': 'symbols_required'})
+            return _build_json_response(200, _build_divid_factors_payload(symbols, start, end))
+        if path == '/instrument-bulk':
+            symbols_raw = (query.get('symbols') or [''])[0] or ''
+            symbols = [item.strip().upper() for item in symbols_raw.split(',') if item.strip()]
+            if not symbols:
+                return _build_json_response(400, {'error': 'symbols_required'})
+            return _build_json_response(200, _build_instrument_bulk_payload(symbols))
+        if path == '/turnover-rate':
+            symbols_raw = (query.get('symbols') or [''])[0] or ''
+            symbols = [item.strip().upper() for item in symbols_raw.split(',') if item.strip()]
+            start = (query.get('start') or [None])[0]
+            end = (query.get('end') or [None])[0]
+            if not symbols:
+                return _build_json_response(400, {'error': 'symbols_required'})
+            return _build_json_response(200, _build_turnover_rate_payload(symbols, start, end))
+        if path == '/total-share':
+            symbols_raw = (query.get('symbols') or [''])[0] or ''
+            symbols = [item.strip().upper() for item in symbols_raw.split(',') if item.strip()]
+            if not symbols:
+                return _build_json_response(400, {'error': 'symbols_required'})
+            return _build_json_response(200, _build_total_share_payload(symbols))
+        if path == '/trading-dates':
+            symbol = _normalize_quote_symbol((query.get('symbol') or [None])[0])
+            start = (query.get('start') or [None])[0]
+            end = (query.get('end') or [None])[0]
+            count = _normalize_int((query.get('count') or [None])[0])
+            period = str((query.get('period') or ['1d'])[0] or '1d')
+            if symbol is None:
+                return _build_json_response(400, {'error': 'symbol_required'})
+            return _build_json_response(200, _build_trading_dates_payload(symbol, start, end, count, period))
+        if path == '/sector':
+            name = (query.get('name') or [None])[0]
+            with_weight = _normalize_bool_flag((query.get('with_weight') or ['0'])[0]) is True
+            index_code = (query.get('index_code') or [None])[0]
+            realtime_raw = (query.get('realtime') or [None])[0]
+            realtime = _normalize_int(realtime_raw) if realtime_raw not in (None, '') else None
+            if name in (None, ''):
+                return _build_json_response(400, {'error': 'name_required'})
+            payload = _build_sector_payload(name, with_weight, index_code, realtime)
+            status_code = 200 if not payload.get('error') else 400
+            return _build_json_response(status_code, payload)
         if path == '/signals':
             symbol = _normalize_quote_symbol((query.get('symbol') or [None])[0])
             return _build_json_response(200, _build_signals_payload(symbol))
