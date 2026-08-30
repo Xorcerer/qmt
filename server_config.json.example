@@ -1,7 +1,7 @@
 {
   "account_id": "your-account-id",
   "account_type": "STOCK",
-  "auth_token": "replace-with-a-strong-token-or-empty-to-disable",
+  "auth_token": "replace-with-a-strong-token-never-leave-empty",
   "quote_symbols": [
     "600000.SH"
   ],

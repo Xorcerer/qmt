@@ -6,6 +6,7 @@ import traceback
 from urllib.parse import parse_qs, urlparse
 
 from server_http_utils import (
+    build_forbidden_host_response as http_build_forbidden_host_response,
     build_json_response as http_build_json_response,
     build_unauthorized_response as http_build_unauthorized_response,
     build_websocket_handshake_response as http_build_websocket_handshake_response,
@@ -14,6 +15,7 @@ from server_http_utils import (
     build_ws_json_frame as http_build_ws_json_frame,
     build_ws_pong_frame as http_build_ws_pong_frame,
     extract_request_token as http_extract_request_token,
+    is_host_allowed as http_is_host_allowed,
     is_request_authorized as http_is_request_authorized,
     parse_http_request as http_parse_http_request,
     queue_client_response as http_queue_client_response,
@@ -55,7 +57,9 @@ from server_socket_utils import (
 
 
 RUNTIME_MODULE_NAME = 'qmt_live_runtime'
-HTTP_SERVER_VERSION = 7
+# Bumping this forces _ensure_http_listener to rebind and drop existing clients, so
+# connections established before an auth change cannot keep streaming unauthenticated.
+HTTP_SERVER_VERSION = 8
 HTTP_HOST = '127.0.0.1'
 HTTP_PORT = 18080
 TIMER_CALLBACK_NAME = 'server_tick'
@@ -75,6 +79,20 @@ DEFAULT_QUOTE_DIVIDEND_TYPE = 'none'
 DEFAULT_CANDLE_DIVIDEND_TYPE = 'front_ratio'
 CORS_ALLOW_HEADERS = 'Authorization, X-QMT-Token, Content-Type, Sec-WebSocket-Protocol'
 CORS_ALLOW_METHODS = 'GET, OPTIONS'
+# Empty disables CORS entirely. The only intended client is the Django backend over
+# loopback; advertising CORS would expose /order and the account endpoints to any page
+# a browser on this host happens to load.
+CORS_ALLOW_ORIGIN = ''
+ALLOWED_HTTP_HOSTS = (
+    '127.0.0.1:%s' % HTTP_PORT,
+    'localhost:%s' % HTTP_PORT,
+    '127.0.0.1',
+    'localhost',
+)
+# Order guardrails: a bug or a stolen token must not be able to move the whole account.
+MAX_ORDER_NOTIONAL = 200000.0
+MAX_ORDER_VOLUME = 100000
+MAX_ORDERS_PER_MINUTE = 30
 SERVER_CONFIG_FILE = os.path.join(os.path.dirname(__file__), 'server_config.json')
 CONTEXT_ACCOUNT_METHOD_CANDIDATES = [
     'get_account',
@@ -160,6 +178,9 @@ def _create_runtime():
         'quote_dividend_type': DEFAULT_QUOTE_DIVIDEND_TYPE,
         'subscription_account_id': None,
         'active_client_count': 0,
+        'recent_order_times': [],
+        'last_order_reject_at': None,
+        'last_order_reject_reason': None,
         'server_version': HTTP_SERVER_VERSION,
     })
 
@@ -1162,6 +1183,12 @@ def _build_health_payload():
         'timer_start_time': RUNTIME.state['timer_start_time'],
         'timer_market': RUNTIME.state['timer_market'],
         'auth_enabled': RUNTIME.state['auth_enabled'],
+        'max_order_notional': MAX_ORDER_NOTIONAL,
+        'max_order_volume': MAX_ORDER_VOLUME,
+        'max_orders_per_minute': MAX_ORDERS_PER_MINUTE,
+        'orders_in_last_minute': len(_prune_recent_order_times(_now())),
+        'last_order_reject_at': RUNTIME.state['last_order_reject_at'],
+        'last_order_reject_reason': RUNTIME.state['last_order_reject_reason'],
         'init_count': RUNTIME.state['init_count'],
         'handlebar_count': RUNTIME.state['handlebar_count'],
         'last_init_at': RUNTIME.state['last_init_at'],
@@ -1326,6 +1353,41 @@ def _call_passorder_with_fallbacks(passorder_func, args_variants):
     return None, last_exc, None
 
 
+def _reject_order(reason, detail):
+    RUNTIME.state['last_order_reject_at'] = _now()
+    RUNTIME.state['last_order_reject_reason'] = reason
+    _log('order rejected reason=%s detail=%s' % (reason, detail))
+    return {'error': reason, 'detail': detail}
+
+
+def _prune_recent_order_times(now):
+    recent = [item for item in RUNTIME.state.get('recent_order_times') or [] if now - item < 60.0]
+    RUNTIME.state['recent_order_times'] = recent
+    return recent
+
+
+def _check_order_guardrails(price, volume):
+    """Cap per-order size and submission rate so a stolen token cannot drain the account."""
+    if volume > MAX_ORDER_VOLUME:
+        return _reject_order(
+            'volume_limit_exceeded',
+            'volume %s exceeds per-order cap %s' % (volume, MAX_ORDER_VOLUME),
+        )
+    notional = price * volume
+    if notional > MAX_ORDER_NOTIONAL:
+        return _reject_order(
+            'notional_limit_exceeded',
+            'notional %.2f exceeds per-order cap %.2f' % (notional, MAX_ORDER_NOTIONAL),
+        )
+    recent = _prune_recent_order_times(_now())
+    if len(recent) >= MAX_ORDERS_PER_MINUTE:
+        return _reject_order(
+            'order_rate_limited',
+            '%s orders in the last minute exceeds cap %s' % (len(recent), MAX_ORDERS_PER_MINUTE),
+        )
+    return None
+
+
 def _get_passorder_callable(context):
     func = globals().get('passorder')
     if callable(func):
@@ -1353,6 +1415,9 @@ def _submit_stock_order(symbol, side, price, volume, remark, batch_id, source, p
         return {'error': 'invalid_price'}
     if normalized_volume is None:
         return {'error': 'invalid_volume'}
+    guardrail_error = _check_order_guardrails(normalized_price, normalized_volume)
+    if guardrail_error is not None:
+        return guardrail_error
     account_id = RUNTIME.state.get('account_id')
     if account_id in (None, ''):
         return {'error': 'account_unavailable'}
@@ -1382,6 +1447,8 @@ def _submit_stock_order(symbol, side, price, volume, remark, batch_id, source, p
             'detail': str(signature_error),
             'symbol': normalized_symbol,
         }
+    submitted_at = _now()
+    RUNTIME.state['recent_order_times'] = _prune_recent_order_times(submitted_at) + [submitted_at]
     _try_refresh_positions(context, force=True)
     return {
         'status': 'submitted',
@@ -1429,7 +1496,9 @@ def _build_instrument_payload(symbol):
 
 
 def _build_json_response(status_code, payload, extra_headers=None):
-    return http_build_json_response(status_code, payload, CORS_ALLOW_HEADERS, CORS_ALLOW_METHODS, extra_headers)
+    return http_build_json_response(
+        status_code, payload, CORS_ALLOW_HEADERS, CORS_ALLOW_METHODS, extra_headers, CORS_ALLOW_ORIGIN,
+    )
 
 
 def _extract_request_token(headers):
@@ -1440,8 +1509,16 @@ def _is_request_authorized(request):
     return http_is_request_authorized(request, RUNTIME.state['configured_auth_token'], _normalize_auth_token)
 
 
+def _is_host_allowed(request):
+    return http_is_host_allowed(request, ALLOWED_HTTP_HOSTS)
+
+
 def _build_unauthorized_response():
-    return http_build_unauthorized_response(CORS_ALLOW_HEADERS, CORS_ALLOW_METHODS)
+    return http_build_unauthorized_response(CORS_ALLOW_HEADERS, CORS_ALLOW_METHODS, CORS_ALLOW_ORIGIN)
+
+
+def _build_forbidden_host_response():
+    return http_build_forbidden_host_response(CORS_ALLOW_HEADERS, CORS_ALLOW_METHODS, CORS_ALLOW_ORIGIN)
 
 
 def _parse_http_request(request_bytes):
@@ -1456,6 +1533,8 @@ def _build_websocket_handshake_response(request):
         _normalize_auth_token,
         CORS_ALLOW_HEADERS,
         CORS_ALLOW_METHODS,
+        ALLOWED_HTTP_HOSTS,
+        CORS_ALLOW_ORIGIN,
     )
 
 
@@ -1484,6 +1563,8 @@ def _build_http_response(request_bytes):
         request = _parse_http_request(request_bytes)
         if request is None:
             return _build_json_response(404, {'error': 'invalid_request'})
+        if not _is_host_allowed(request):
+            return _build_forbidden_host_response()
         if request['method'] == 'OPTIONS':
             return _build_json_response(200, {'status': 'ok'})
         authorized, _ = _is_request_authorized(request)

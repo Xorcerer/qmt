@@ -1,17 +1,21 @@
 import base64
 import hashlib
+import hmac
 import json
 from urllib.parse import urlparse
 
 
-def build_json_response(status_code, payload, allow_headers, allow_methods, extra_headers=None):
+def build_json_response(status_code, payload, allow_headers, allow_methods, extra_headers=None, allow_origin=''):
     reason_map = {
         200: 'OK',
         204: 'No Content',
+        400: 'Bad Request',
         401: 'Unauthorized',
+        403: 'Forbidden',
         404: 'Not Found',
         405: 'Method Not Allowed',
         413: 'Payload Too Large',
+        429: 'Too Many Requests',
         500: 'Internal Server Error',
     }
     body = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode('utf-8')
@@ -20,16 +24,21 @@ def build_json_response(status_code, payload, allow_headers, allow_methods, extr
         'Content-Type: application/json; charset=utf-8',
         'Content-Length: %s' % len(body),
         'Connection: close',
+        'Cache-Control: no-store',
     ]
     if extra_headers:
         header_lines.extend(extra_headers)
-    header_lines.extend([
-        'Access-Control-Allow-Origin: *',
-        'Access-Control-Allow-Headers: %s' % allow_headers,
-        'Access-Control-Allow-Methods: %s' % allow_methods,
-        '',
-        '',
-    ])
+    # Only advertise CORS when an origin is explicitly allowed. The sole intended
+    # consumer is the Django backend over loopback, which needs no CORS at all;
+    # emitting a wildcard would let any page in a browser on this host read the
+    # trading account and reach /order.
+    if allow_origin:
+        header_lines.extend([
+            'Access-Control-Allow-Origin: %s' % allow_origin,
+            'Access-Control-Allow-Headers: %s' % allow_headers,
+            'Access-Control-Allow-Methods: %s' % allow_methods,
+        ])
+    header_lines.extend(['', ''])
     return '\r\n'.join(header_lines).encode('utf-8') + body
 
 
@@ -58,16 +67,39 @@ def extract_request_token(headers, normalize_auth_token):
 
 
 def is_request_authorized(request, configured_auth_token, normalize_auth_token):
+    """Fail closed: an unset auth_token denies every request rather than allowing all.
+
+    This server can place real orders, so a missing or unreadable server_config.json
+    must never degrade into an open endpoint.
+    """
     if not configured_auth_token:
-        return True, None
+        return False, None
     provided_token, ws_protocol = extract_request_token(request['headers'], normalize_auth_token)
     if provided_token is None:
         return False, None
-    return provided_token == configured_auth_token, ws_protocol
+    if len(provided_token) != len(configured_auth_token):
+        return False, ws_protocol
+    return hmac.compare_digest(provided_token, configured_auth_token), ws_protocol
 
 
-def build_unauthorized_response(allow_headers, allow_methods):
-    return build_json_response(401, {'error': 'unauthorized'}, allow_headers, allow_methods)
+def is_host_allowed(request, allowed_hosts):
+    """Reject requests whose Host header is not a loopback name, blocking DNS rebinding."""
+    host = (request['headers'].get('host') or '').strip().lower()
+    if not host:
+        return False
+    return host in allowed_hosts
+
+
+def build_unauthorized_response(allow_headers, allow_methods, allow_origin=''):
+    return build_json_response(
+        401, {'error': 'unauthorized'}, allow_headers, allow_methods, allow_origin=allow_origin,
+    )
+
+
+def build_forbidden_host_response(allow_headers, allow_methods, allow_origin=''):
+    return build_json_response(
+        403, {'error': 'host_not_allowed'}, allow_headers, allow_methods, allow_origin=allow_origin,
+    )
 
 
 def parse_http_request(request_bytes):
@@ -101,6 +133,8 @@ def build_websocket_handshake_response(
     normalize_auth_token,
     allow_headers,
     allow_methods,
+    allowed_hosts=(),
+    allow_origin='',
 ):
     if request is None:
         return None, False
@@ -115,9 +149,11 @@ def build_websocket_handshake_response(
     websocket_key = headers.get('sec-websocket-key')
     if not websocket_key:
         return None, False
+    if allowed_hosts and not is_host_allowed(request, allowed_hosts):
+        return build_forbidden_host_response(allow_headers, allow_methods, allow_origin), False
     authorized, ws_protocol = is_request_authorized(request, configured_auth_token, normalize_auth_token)
     if not authorized:
-        return build_unauthorized_response(allow_headers, allow_methods), False
+        return build_unauthorized_response(allow_headers, allow_methods, allow_origin), False
     accept_source = (websocket_key + websocket_guid).encode('utf-8')
     accept_value = base64.b64encode(hashlib.sha1(accept_source).digest()).decode('ascii')
     response_lines = [

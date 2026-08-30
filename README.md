@@ -15,6 +15,7 @@
 - `server.py`：HTTP / WebSocket 服务主入口
 - `server_http_utils.py`：HTTP / WebSocket 握手与帧工具
 - `server_market_utils.py`：行情、K 线、龙虎榜、信号点整理
+- `server_fundamental_utils.py`：复权因子、批量标的、换手率、股本、交易日历、板块成分
 - `server_socket_utils.py`：非阻塞 socket 轮询
 - `server_runtime_utils.py`：运行时状态与序列化工具
 - `server_config.json.example`：示例配置
@@ -48,6 +49,7 @@
   - `server.py`
   - `server_http_utils.py`
   - `server_market_utils.py`
+  - `server_fundamental_utils.py`
   - `server_runtime_utils.py`
   - `server_socket_utils.py`
 
@@ -58,7 +60,7 @@
 示例字段：
 - `account_id`：账户号；如果 `ContextInfo` 能自动识别，可留空
 - `account_type`：默认 `STOCK`
-- `auth_token`：访问令牌；为空表示不启用鉴权
+- `auth_token`：访问令牌，**必填**。为空时服务器拒绝所有请求（fail-closed），不要留空来“关闭鉴权”
 - `quote_symbols`：启动时自动订阅的行情代码
 - `quote_period`：默认 `tick`
 - `quote_dividend_type`：默认 `none`
@@ -68,16 +70,45 @@
 - 当前代码会热加载 `server_config.json`，修改后无需重启 Python 进程即可生效。
 
 ## 鉴权
-- 如果 `auth_token` 为空：HTTP / WebSocket 不鉴权
-- 如果 `auth_token` 非空：
-  - HTTP 支持 `Authorization: Bearer <token>`
-  - HTTP 支持 `X-QMT-Token: <token>`
+本服务能提交真实委托，因此鉴权是 **fail-closed** 的：
+
+- `auth_token` 为空（或配置文件读取失败）：**拒绝所有请求**，返回 `401 {"error":"unauthorized"}`
+- `auth_token` 非空，以下任一方式通过即可：
+  - HTTP `Authorization: Bearer <token>`
+  - HTTP `X-QMT-Token: <token>`
   - WebSocket 握手支持上述 Header
   - WebSocket 也支持 `Sec-WebSocket-Protocol: qmt-token.<token>`
 
+令牌比较使用 `hmac.compare_digest`，避免时序侧信道。
+
+调用方（algo_monitor 的 Django 后端）从 `config.yaml` 的 `qmt_auth_token` 或环境变量
+`QMT_AUTH_TOKEN` 读取同一个令牌，两边必须一致。
+
+### 其他访问控制
+- **Host 白名单**：只接受 `127.0.0.1[:18080]` / `localhost[:18080]`，其他 Host 返回
+  `403 {"error":"host_not_allowed"}`，用于阻断 DNS rebinding
+- **不返回任何 CORS 头**（`CORS_ALLOW_ORIGIN = ''`）：唯一调用方是同机的 Django 后端，
+  不需要浏览器跨域；一旦返回 `Access-Control-Allow-Origin: *`，本机浏览器打开的任意
+  网页都能读账户并调用 `/order`
+
+### 下单限额
+`server.py` 顶部的常量对每一笔委托做硬性约束，超限直接拒绝并记入 `/health`：
+
+- `MAX_ORDER_NOTIONAL`（单笔金额上限，默认 200000）
+- `MAX_ORDER_VOLUME`（单笔数量上限，默认 100000）
+- `MAX_ORDERS_PER_MINUTE`（每分钟报单数上限，默认 30）
+
 建议：
-- 对外开放前务必配置强随机 `auth_token`
+- 令牌用 `python -c "import secrets;print(secrets.token_urlsafe(40))"` 生成
 - 不要把真实 `server_config.json` 或令牌提交到仓库
+- NAS 日更 **不直连** 本服务，只打 Django `/api/ingest/qmt/...`（Bearer `ALGO_MONITOR_API_TOKEN`）；Django 再用本段 `QMT_AUTH_TOKEN` 调 `127.0.0.1:18080`
+- 在 benben 上探测本服务时用 `curl.exe`（PowerShell 的 `curl` 是 `Invoke-WebRequest` 别名，会挂死无输出）：
+
+```powershell
+curl.exe -s --max-time 10 -H "Authorization: Bearer <auth_token>" http://127.0.0.1:18080/health
+```
+
+公网 `https://benben.cafe/qmt/` 是 Django staff 代理，未登录 401，不是本端口。
 
 ## 运行机制
 - 默认监听 `127.0.0.1:18080`
@@ -121,7 +152,14 @@
 
 ### K 线、标的信息与期权
 - `GET /candles?symbol=000300.SH&period=1d&count=240`：K 线
+- `GET /candles-bulk?symbols=600000.SH,000001.SZ&period=1d&start=&end=`：批量日 K（NAS ingest 经 Django 转发）
 - `GET /instrument?symbol=000300.SH`：标的基本信息
+- `GET /instrument-bulk?symbols=600000.SH,000001.SZ`：批量标的信息
+- `GET /divid-factors?symbols=...&start=&end=`：复权因子
+- `GET /turnover-rate?symbols=...&start=&end=`：换手率
+- `GET /total-share?symbols=...`：总股本
+- `GET /trading-dates?symbol=000001.SZ&start=&end=`：交易日历
+- `GET /sector?name=沪深300`：板块 / 指数成分
 - `GET /options?...`：期权列表与可选附加信息
 - `GET /option-trade-options`：期权交易相关选项
 
@@ -143,6 +181,8 @@
 ### 外部程序连不上
 - 检查 QMT 策略是否已启动
 - 检查本机 `127.0.0.1:18080` 是否被监听
+- 远程请用 `curl.exe`，不要用 `curl`
+- 401：缺 Bearer / `X-QMT-Token`，或 `auth_token` 为空（fail-closed）
 - 查看 `/health` 输出中的 `last_error`、`listener_ready`、`account_source`
 
 ### 订阅没有推送
