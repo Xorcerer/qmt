@@ -4,9 +4,8 @@ import types
 
 def create_runtime(runtime_module_name, initial_state):
     runtime = types.ModuleType(runtime_module_name)
-    runtime.listener = None
+    runtime.bridge = None
     runtime.context_ref = None
-    runtime.clients = {}
     runtime.position_index = {}
     runtime.order_index = {}
     runtime.deal_index = {}
@@ -34,7 +33,21 @@ def upgrade_runtime(runtime, defaults):
             old_http_thread.join(2.0)
         except Exception:
             pass
-    for name in ['listener', 'context_ref', 'clients', 'position_index', 'order_index', 'deal_index', 'quote_subscriptions', 'latest_quotes', 'quote_sequence']:
+    # Close sockets left by the pre-shared-memory implementation during hot reload.
+    old_listener = getattr(runtime, 'listener', None)
+    if old_listener is not None:
+        try:
+            old_listener.close()
+        except Exception:
+            pass
+        runtime.listener = None
+    for client in list(getattr(runtime, 'clients', {}).values()):
+        try:
+            client['socket'].close()
+        except Exception:
+            pass
+    runtime.clients = {}
+    for name in ['bridge', 'context_ref', 'position_index', 'order_index', 'deal_index', 'quote_subscriptions', 'latest_quotes', 'quote_sequence']:
         if not hasattr(runtime, name):
             setattr(runtime, name, getattr(defaults, name))
     state = getattr(runtime, 'state', None)

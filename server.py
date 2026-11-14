@@ -1,25 +1,8 @@
 import json
-import os
-import socket
 import sys
 import traceback
 from urllib.parse import parse_qs, urlparse
 
-from server_http_utils import (
-    build_forbidden_host_response as http_build_forbidden_host_response,
-    build_json_response as http_build_json_response,
-    build_unauthorized_response as http_build_unauthorized_response,
-    build_websocket_handshake_response as http_build_websocket_handshake_response,
-    build_ws_close_frame as http_build_ws_close_frame,
-    build_ws_frame as http_build_ws_frame,
-    build_ws_json_frame as http_build_ws_json_frame,
-    build_ws_pong_frame as http_build_ws_pong_frame,
-    extract_request_token as http_extract_request_token,
-    is_host_allowed as http_is_host_allowed,
-    is_request_authorized as http_is_request_authorized,
-    parse_http_request as http_parse_http_request,
-    queue_client_response as http_queue_client_response,
-)
 from server_fundamental_utils import (
     build_divid_factors_payload as fundamental_build_divid_factors_payload,
     build_instrument_bulk_payload as fundamental_build_instrument_bulk_payload,
@@ -46,54 +29,28 @@ from server_runtime_utils import (
     now as runtime_now,
     upgrade_runtime as runtime_upgrade_runtime,
 )
-from server_socket_utils import (
-    accept_new_clients as socket_accept_new_clients,
-    consume_ws_frames as socket_consume_ws_frames,
-    poll_clients as socket_poll_clients,
-    push_ws_updates as socket_push_ws_updates,
-    recv_from_client as socket_recv_from_client,
-    send_to_client as socket_send_to_client,
-)
+from shared_memory_protocol import DEFAULT_NAME, SharedMemoryChannel
 
 
 RUNTIME_MODULE_NAME = 'qmt_live_runtime'
-# Bumping this forces _ensure_http_listener to rebind and drop existing clients, so
-# connections established before an auth change cannot keep streaming unauthenticated.
-HTTP_SERVER_VERSION = 8
+HTTP_SERVER_VERSION = 9
+SHARED_MEMORY_NAME = DEFAULT_NAME
 HTTP_HOST = '127.0.0.1'
 HTTP_PORT = 18080
 TIMER_CALLBACK_NAME = 'server_tick'
 HTTP_TIMER_PERIOD = '10nMilliSecond'
 HTTP_TIMER_START_TIME = '2000-01-01 00:00:00'
 HTTP_TIMER_MARKET = 'SH'
-WEBSOCKET_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
 REFRESH_INTERVAL_SECONDS = 5.0
-CLIENT_TIMEOUT_SECONDS = 5.0
-MAX_ACCEPTS_PER_TICK = 32
-MAX_READS_PER_CLIENT = 4
-MAX_REQUEST_SIZE = 65536
-CONFIG_RELOAD_INTERVAL_SECONDS = 1.0
 DEFAULT_ACCOUNT_TYPE = 'STOCK'
 DEFAULT_QUOTE_PERIOD = 'tick'
 DEFAULT_QUOTE_DIVIDEND_TYPE = 'none'
 DEFAULT_CANDLE_DIVIDEND_TYPE = 'front_ratio'
-CORS_ALLOW_HEADERS = 'Authorization, X-QMT-Token, Content-Type, Sec-WebSocket-Protocol'
-CORS_ALLOW_METHODS = 'GET, OPTIONS'
-# Empty disables CORS entirely. The only intended client is the Django backend over
-# loopback; advertising CORS would expose /order and the account endpoints to any page
-# a browser on this host happens to load.
-CORS_ALLOW_ORIGIN = ''
-ALLOWED_HTTP_HOSTS = (
-    '127.0.0.1:%s' % HTTP_PORT,
-    'localhost:%s' % HTTP_PORT,
-    '127.0.0.1',
-    'localhost',
-)
 # Order guardrails: a bug or a stolen token must not be able to move the whole account.
 MAX_ORDER_NOTIONAL = 200000.0
 MAX_ORDER_VOLUME = 100000
 MAX_ORDERS_PER_MINUTE = 30
-SERVER_CONFIG_FILE = os.path.join(os.path.dirname(__file__), 'server_config.json')
+SERVER_CONFIG_FILE = 'external_gateway'
 CONTEXT_ACCOUNT_METHOD_CANDIDATES = [
     'get_account',
     'get_accounts',
@@ -126,8 +83,10 @@ def _create_runtime():
         'http_host': HTTP_HOST,
         'http_port': HTTP_PORT,
         'http_started_at': None,
-        'http_mode': 'runtime_poll',
+        'http_mode': 'shared_memory',
+        'shared_memory_name': SHARED_MEMORY_NAME,
         'listener_ready': False,
+        'last_published_quote_sequence': -1,
         'timer_registered': False,
         'timer_callback': TIMER_CALLBACK_NAME,
         'timer_period': HTTP_TIMER_PERIOD,
@@ -658,29 +617,10 @@ def _apply_context_account_subscription(context):
         _record_error('_apply_context_account_subscription')
 
 
-def _load_runtime_config(context):
-    now = _now()
-    last_config_load_at = RUNTIME.state['last_config_load_at']
-    if last_config_load_at is not None and now - last_config_load_at < CONFIG_RELOAD_INTERVAL_SECONDS:
-        return
-    RUNTIME.state['last_config_load_at'] = now
-    try:
-        stat_result = os.stat(SERVER_CONFIG_FILE)
-    except OSError:
-        RUNTIME.state['config_mtime'] = None
-        RUNTIME.state['configured_account_id'] = None
-        RUNTIME.state['configured_account_type'] = None
-        return
-    mtime = int(stat_result.st_mtime * 1000000)
-    if RUNTIME.state['config_mtime'] == mtime:
-        return
-    RUNTIME.state['config_mtime'] = mtime
-    try:
-        with open(SERVER_CONFIG_FILE, 'r', encoding='utf-8') as handle:
-            payload = json.load(handle)
-    except Exception:
-        _record_error('_load_runtime_config')
-        return
+def _apply_runtime_config(payload, context):
+    """Apply configuration supplied by the external gateway through shared memory."""
+    if not isinstance(payload, dict):
+        raise ValueError('config payload must be an object')
     configured_account_id = payload.get('account_id')
     configured_account_type = _normalize_account_type(payload.get('account_type'))
     configured_auth_token = _normalize_auth_token(payload.get('auth_token'))
@@ -689,20 +629,26 @@ def _load_runtime_config(context):
     RUNTIME.state['quote_dividend_type'] = str(payload.get('quote_dividend_type') or DEFAULT_QUOTE_DIVIDEND_TYPE)
     RUNTIME.state['configured_auth_token'] = configured_auth_token
     RUNTIME.state['auth_enabled'] = configured_auth_token is not None
+    RUNTIME.state['last_config_load_at'] = _now()
     if configured_account_id in (None, ''):
         RUNTIME.state['configured_account_id'] = None
         RUNTIME.state['configured_account_type'] = None
-        return
-    configured_account_id = str(configured_account_id)
-    if configured_account_type is None:
-        configured_account_type = DEFAULT_ACCOUNT_TYPE
-    RUNTIME.state['configured_account_id'] = configured_account_id
-    RUNTIME.state['configured_account_type'] = configured_account_type
-    RUNTIME.state['account_id'] = configured_account_id
-    RUNTIME.state['account_type'] = configured_account_type
-    RUNTIME.state['account_source'] = 'config'
-    _apply_context_account_subscription(context)
-    _log('config account loaded type=%s' % configured_account_type)
+    else:
+        configured_account_id = str(configured_account_id)
+        if configured_account_type is None:
+            configured_account_type = DEFAULT_ACCOUNT_TYPE
+        RUNTIME.state['configured_account_id'] = configured_account_id
+        RUNTIME.state['configured_account_type'] = configured_account_type
+        RUNTIME.state['account_id'] = configured_account_id
+        RUNTIME.state['account_type'] = configured_account_type
+        RUNTIME.state['account_source'] = 'external_config'
+        _apply_context_account_subscription(context)
+    if RUNTIME.context_ref is not None:
+        _ensure_quote_subscriptions(RUNTIME.context_ref)
+    # A successful external config replaces errors left by the retired file loader.
+    RUNTIME.state['last_error_at'] = None
+    RUNTIME.state['last_error'] = None
+    _log('external config applied account_type=%s' % RUNTIME.state.get('configured_account_type'))
 
 
 def _extract_code(position):
@@ -1161,10 +1107,8 @@ def _try_refresh_positions(context, force=False):
 
 
 def _get_code_mtime():
-    try:
-        return os.path.getmtime(__file__)
-    except Exception:
-        return None
+    # QMT is not permitted to inspect or read files; retained for API compatibility.
+    return None
 
 
 def _build_health_payload():
@@ -1173,6 +1117,7 @@ def _build_health_payload():
         'server_version': HTTP_SERVER_VERSION,
         'code_mtime': _get_code_mtime(),
         'http_mode': RUNTIME.state['http_mode'],
+        'shared_memory_name': RUNTIME.state.get('shared_memory_name'),
         'http_host': RUNTIME.state['http_host'],
         'http_port': RUNTIME.state['http_port'],
         'http_started_at': RUNTIME.state['http_started_at'],
@@ -1496,82 +1441,19 @@ def _build_instrument_payload(symbol):
 
 
 def _build_json_response(status_code, payload, extra_headers=None):
-    return http_build_json_response(
-        status_code, payload, CORS_ALLOW_HEADERS, CORS_ALLOW_METHODS, extra_headers, CORS_ALLOW_ORIGIN,
-    )
+    # The external gateway serializes this status/payload pair as HTTP JSON.
+    return status_code, payload
 
 
-def _extract_request_token(headers):
-    return http_extract_request_token(headers, _normalize_auth_token)
-
-
-def _is_request_authorized(request):
-    return http_is_request_authorized(request, RUNTIME.state['configured_auth_token'], _normalize_auth_token)
-
-
-def _is_host_allowed(request):
-    return http_is_host_allowed(request, ALLOWED_HTTP_HOSTS)
-
-
-def _build_unauthorized_response():
-    return http_build_unauthorized_response(CORS_ALLOW_HEADERS, CORS_ALLOW_METHODS, CORS_ALLOW_ORIGIN)
-
-
-def _build_forbidden_host_response():
-    return http_build_forbidden_host_response(CORS_ALLOW_HEADERS, CORS_ALLOW_METHODS, CORS_ALLOW_ORIGIN)
-
-
-def _parse_http_request(request_bytes):
-    return http_parse_http_request(request_bytes)
-
-
-def _build_websocket_handshake_response(request):
-    return http_build_websocket_handshake_response(
-        request,
-        WEBSOCKET_GUID,
-        RUNTIME.state['configured_auth_token'],
-        _normalize_auth_token,
-        CORS_ALLOW_HEADERS,
-        CORS_ALLOW_METHODS,
-        ALLOWED_HTTP_HOSTS,
-        CORS_ALLOW_ORIGIN,
-    )
-
-
-def _build_ws_frame(payload_bytes, opcode=1):
-    return http_build_ws_frame(payload_bytes, opcode)
-
-
-def _build_ws_json_frame(payload):
-    return http_build_ws_json_frame(payload)
-
-
-def _build_ws_close_frame():
-    return http_build_ws_close_frame()
-
-
-def _build_ws_pong_frame(payload_bytes):
-    return http_build_ws_pong_frame(payload_bytes)
-
-
-def _queue_client_response(client, payload_bytes):
-    return http_queue_client_response(client, payload_bytes)
-
-
-def _build_http_response(request_bytes):
+def _build_http_response(request):
     try:
-        request = _parse_http_request(request_bytes)
-        if request is None:
+        if not isinstance(request, dict):
             return _build_json_response(404, {'error': 'invalid_request'})
-        if not _is_host_allowed(request):
-            return _build_forbidden_host_response()
-        if request['method'] == 'OPTIONS':
+        method = str(request.get('method') or '').upper()
+        raw_target = str(request.get('target') or '/')
+        if method == 'CONFIG' and raw_target == '/__bridge/config':
+            _apply_runtime_config(request.get('config'), RUNTIME.context_ref)
             return _build_json_response(200, {'status': 'ok'})
-        authorized, _ = _is_request_authorized(request)
-        if not authorized:
-            return _build_unauthorized_response()
-        method = request['method']
-        raw_target = request['target']
         if method != 'GET':
             return _build_json_response(405, {'error': 'method_not_allowed', 'method': method})
         parsed = urlparse(raw_target)
@@ -1580,7 +1462,7 @@ def _build_http_response(request_bytes):
         if path == '/':
             return _build_json_response(200, {
                 'name': 'qmt-position-server',
-                'mode': 'runtime_poll',
+                'mode': 'shared_memory',
                 'endpoints': [
                     '/health', '/positions', '/accounts', '/quotes', '/quote',
                     '/orders', '/deals', '/subscribe', '/unsubscribe', '/candles', '/candles-bulk', '/signals', '/instrument',
@@ -1777,57 +1659,39 @@ def _build_http_response(request_bytes):
         return _build_json_response(500, {'error': 'internal_error'})
 
 
-def _close_socket(sock):
-    if sock is None:
-        return
-    try:
-        sock.close()
-    except Exception:
-        pass
-
-
-def _close_client(client_key):
-    client = RUNTIME.clients.pop(client_key, None)
-    if client is None:
-        return
-    _close_socket(client.get('socket'))
-    RUNTIME.state['active_client_count'] = len(RUNTIME.clients)
-
-
-def _close_all_clients():
-    for client_key in list(RUNTIME.clients.keys()):
-        _close_client(client_key)
-
-
-def _reset_listener():
-    _close_all_clients()
-    _close_socket(RUNTIME.listener)
-    RUNTIME.listener = None
+def _reset_shared_memory():
+    bridge = getattr(RUNTIME, 'bridge', None)
+    if bridge is not None:
+        try:
+            bridge.close()
+        except Exception:
+            pass
+    RUNTIME.bridge = None
     RUNTIME.state['listener_ready'] = False
 
 
-def _ensure_http_listener():
-    if RUNTIME.listener is not None and RUNTIME.state.get('server_version') == HTTP_SERVER_VERSION:
+def _ensure_shared_memory():
+    if getattr(RUNTIME, 'bridge', None) is not None:
         return
-    _reset_listener()
     try:
-        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        listener.bind((HTTP_HOST, HTTP_PORT))
-        listener.listen(128)
-        listener.setblocking(False)
-        RUNTIME.listener = listener
+        bridge = SharedMemoryChannel(name=SHARED_MEMORY_NAME)
+        bridge.open(initialize=False)
+        RUNTIME.bridge = bridge
         RUNTIME.state['server_version'] = HTTP_SERVER_VERSION
+        RUNTIME.state['http_mode'] = 'shared_memory'
+        RUNTIME.state['shared_memory_name'] = SHARED_MEMORY_NAME
         RUNTIME.state['http_started_at'] = _now()
-        RUNTIME.state['http_host'] = HTTP_HOST
-        RUNTIME.state['http_port'] = HTTP_PORT
         RUNTIME.state['listener_ready'] = True
-        _log('http listener ready at http://%s:%s' % (HTTP_HOST, HTTP_PORT))
+        RUNTIME.state['last_published_quote_sequence'] = -1
+        _log('shared-memory bridge ready name=%s' % SHARED_MEMORY_NAME)
     except Exception:
-        RUNTIME.state['last_error_at'] = _now()
-        RUNTIME.state['last_error'] = traceback.format_exc()
+        detail = traceback.format_exc()
+        previous_error_at = RUNTIME.state.get('last_error_at')
         RUNTIME.state['listener_ready'] = False
-        _log('http listener start failed\n%s' % RUNTIME.state['last_error'])
+        RUNTIME.state['last_error_at'] = _now()
+        RUNTIME.state['last_error'] = detail
+        if previous_error_at is None or _now() - previous_error_at >= 5.0:
+            _log('shared-memory bridge open failed\n%s' % detail)
 
 
 def _ensure_timer(ContextInfo):
@@ -1848,52 +1712,26 @@ def _ensure_timer(ContextInfo):
         _record_error('_ensure_timer')
 
 
-def _accept_new_clients():
-    return socket_accept_new_clients(RUNTIME, MAX_ACCEPTS_PER_TICK, _now, _log)
+def _bridge_error():
+    _record_error('shared_memory_process')
 
 
-def _consume_ws_frames(client):
-    return socket_consume_ws_frames(client, _queue_client_response, _build_ws_close_frame, _build_ws_pong_frame)
-
-
-def _recv_from_client(client):
-    return socket_recv_from_client(
-        client,
-        MAX_READS_PER_CLIENT,
-        MAX_REQUEST_SIZE,
-        _now,
-        _build_json_response,
-        _parse_http_request,
-        _build_websocket_handshake_response,
-        _build_http_response,
-        _consume_ws_frames,
-    )
-
-
-def _send_to_client(client):
-    return socket_send_to_client(client, _now)
-
-
-def _push_ws_updates():
-    return socket_push_ws_updates(RUNTIME, _build_quotes_payload, _queue_client_response, _build_ws_json_frame)
-
-
-def _poll_clients():
-    return socket_poll_clients(RUNTIME, CLIENT_TIMEOUT_SECONDS, _now, _recv_from_client, _send_to_client, _close_client)
+def _publish_quote_snapshot():
+    if RUNTIME.state.get('last_published_quote_sequence') == RUNTIME.quote_sequence:
+        return
+    RUNTIME.bridge.publish_quotes(_build_quotes_payload())
+    RUNTIME.state['last_published_quote_sequence'] = RUNTIME.quote_sequence
 
 
 def _run_server_tick(ContextInfo):
     _update_context(ContextInfo)
-    _load_runtime_config(ContextInfo)
     _ensure_timer(ContextInfo)
-    _ensure_http_listener()
-    if RUNTIME.listener is None:
+    _ensure_shared_memory()
+    if RUNTIME.bridge is None:
         return
     RUNTIME.state['last_http_poll_at'] = _now()
-    _accept_new_clients()
-    _poll_clients()
-    _push_ws_updates()
-    _poll_clients()
+    RUNTIME.bridge.process_requests(_build_http_response, _bridge_error)
+    _publish_quote_snapshot()
 
 
 def on_event(event_name, *args):
@@ -1928,7 +1766,7 @@ def server_tick(ContextInfo):
 
 
 def handlebar(ContextInfo):
-    _update_context(ContextInfo)
+    _run_server_tick(ContextInfo)
     RUNTIME.state['handlebar_count'] += 1
     RUNTIME.state['last_handlebar_at'] = _now()
     _try_refresh_positions(ContextInfo, force=False)
@@ -1938,7 +1776,7 @@ def handlebar(ContextInfo):
 def stop(ContextInfo):
     _update_context(ContextInfo)
     _clear_quote_subscriptions(ContextInfo)
-    _reset_listener()
+    _reset_shared_memory()
     RUNTIME.context_ref = None
     RUNTIME.state['timer_registered'] = False
     RUNTIME.state['timer_callback'] = TIMER_CALLBACK_NAME
